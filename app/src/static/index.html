@@ -46,11 +46,34 @@
   </table>
 </div>
 
+<div class="card">
+  <h2 style="font-size:1.1rem;margin-top:0">录音对照（比较两份已完成录音的原始片段）</h2>
+  <div>
+    <select id="cmpA"></select>
+    <select id="cmpB"></select>
+    <button onclick="startCompare()">开始对照</button>
+  </div>
+  <p class="muted">
+    按包内 M3U8 顺序读取 TS 并比对字节指纹；匹配保留播放顺序。
+    相同内容反复出现或缺失位置无法唯一确定时，只给出可能范围，需人工核对。
+    清单缺段、包内文件缺失或对照期间包被改写时不发布结果，原下载不受影响。
+  </p>
+  <div id="cmpList"></div>
+  <div id="cmpDetail"></div>
+</div>
+
 <script>
+let jobsCache = [];
+let openCmpId = null;
+
+const esc = s => String(s).replace(/[&<>"']/g,
+  ch => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch]));
+
 async function refresh() {
   try {
     const r = await fetch('/api/jobs');
     const jobs = await r.json();
+    jobsCache = jobs;
     const tbody = document.getElementById('jobs');
     tbody.innerHTML = '';
     for (const j of jobs) {
@@ -68,8 +91,103 @@ async function refresh() {
         + `<td>${miss}${err}</td><td>${ops}</td>`;
       tbody.appendChild(tr);
     }
+    refreshCompareSelectors();
+    refreshComparisons();
   } catch (e) { console.error(e); }
 }
+
+function refreshCompareSelectors() {
+  const done = jobsCache.filter(j => j.state === 'done');
+  for (const id of ['cmpA', 'cmpB']) {
+    const sel = document.getElementById(id);
+    const cur = sel.value;
+    sel.innerHTML = done.map(j =>
+      `<option value="${j.id}">#${j.id}（${j.first_seq}..${j.stop_seq}）${j.url}</option>`).join('');
+    if (cur && done.some(j => String(j.id) === cur)) sel.value = cur;
+    else if (id === 'cmpB' && done.length > 1) sel.value = String(done[1].id);
+  }
+}
+
+async function startCompare() {
+  const a = Number(document.getElementById('cmpA').value);
+  const b = Number(document.getElementById('cmpB').value);
+  if (!a || !b) return alert('请选择两份已完成的录音');
+  const r = await fetch('/api/comparisons', {method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({job_a: a, job_b: b})});
+  if (!r.ok) return alert('对照失败: ' + (await r.json()).detail);
+  openCmpId = (await r.json()).id;
+  refreshComparisons();
+}
+
+async function refreshComparisons() {
+  const r = await fetch('/api/comparisons');
+  const list = await r.json();
+  const div = document.getElementById('cmpList');
+  div.innerHTML = list.map(c => {
+    const st = c.state === 'done'
+      ? (c.result && c.result.status === 'no_common' ? '无共同片段' : '完成')
+      : (c.state === 'failed' ? '未发布' : '对照中…');
+    return `<div><a href="javascript:showCmp(${c.id})">对照 #${c.id}: 录音 ${c.job_a} × 录音 ${c.job_b}</a>
+      <span class="muted">${st}</span></div>`;
+  }).join('') || '<span class="muted">暂无对照</span>';
+  if (openCmpId) showCmp(openCmpId, true);
+}
+
+async function showCmp(id, silent) {
+  openCmpId = id;
+  const c = await (await fetch(`/api/comparisons/${id}`)).json();
+  const div = document.getElementById('cmpDetail');
+  if (c.state === 'running') { div.innerHTML = '<p class="muted">对照中…</p>'; return; }
+  if (c.state === 'failed') {
+    div.innerHTML = `<p class="err">对照未发布结果：${esc(c.error)}。原录音下载不受影响。</p>`;
+    return;
+  }
+  const R = c.result;
+  if (R.status === 'no_common') {
+    div.innerHTML = `<h3>对照 #${c.id}（录音 ${c.job_a} × ${c.job_b}）</h3>
+      <p class="err">两份录音没有共同片段，无法定位差异位置。</p>`;
+    return;
+  }
+  const rng = (lo, hi) => lo === hi ? `${lo}` : `${lo}–${hi}`;
+  const names = arr => arr.length <= 12 ? arr.map(esc).join(', ')
+    : arr.slice(0, 12).map(esc).join(', ') + ` …（共 ${arr.length} 个）`;
+  const uniqRows = arr => {
+    const cap = 200;
+    const rows = arr.slice(0, cap).map(u =>
+      `<tr><td>${u.index}</td><td>${esc(u.name)}</td><td><code>${esc(u.sha256)}…</code></td></tr>`);
+    if (arr.length > cap)
+      rows.push(`<tr><td colspan="3" class="muted">…（共 ${arr.length} 段，完整清单见 API）</td></tr>`);
+    return rows.join('');
+  };
+  let h = `<h3>对照 #${c.id}（录音 ${c.job_a} × ${c.job_b}）</h3>`
+    + `<p>共同片段 <b>${R.common_count}</b> 段（其中位置确定 ${R.definite_pairs} 段）；`
+    + `录音 ${c.job_a} 确定独有 <b>${R.unique_a.length}</b> 段，`
+    + `录音 ${c.job_b} 确定独有 <b>${R.unique_b.length}</b> 段；`
+    + `待人工核对区域 <b>${R.ambiguous_regions.length}</b> 个。</p>`;
+  h += '<h4>确定共同（保序）</h4><table><thead><tr>'
+    + `<th>录音 ${c.job_a} 序号</th><th>录音 ${c.job_b} 序号</th><th>段数</th><th>指纹</th><th>包内文件</th></tr></thead><tbody>`
+    + R.common_blocks.map(b => `<tr><td>${rng(b.a_start, b.a_end)}</td><td>${rng(b.b_start, b.b_end)}</td>`
+      + `<td>${b.count}</td><td><code>${b.sha256}…</code></td>`
+      + `<td class="muted">${names(b.a_names)}<br>${names(b.b_names)}</td></tr>`).join('')
+    + '</tbody></table>';
+  h += `<h4>确定独有 — 录音 ${c.job_a}</h4>` + (R.unique_a.length
+    ? '<table><thead><tr><th>序号</th><th>包内文件</th><th>指纹</th></tr></thead><tbody>'
+      + uniqRows(R.unique_a) + '</tbody></table>' : '<p class="muted">无</p>');
+  h += `<h4>确定独有 — 录音 ${c.job_b}</h4>` + (R.unique_b.length
+    ? '<table><thead><tr><th>序号</th><th>包内文件</th><th>指纹</th></tr></thead><tbody>'
+      + uniqRows(R.unique_b) + '</tbody></table>' : '<p class="muted">无</p>');
+  if (R.ambiguous_regions.length) {
+    h += '<h4 class="err">待人工核对（相同内容反复出现或缺失位置无法唯一确定，不作确定结论）</h4>'
+      + '<table><thead><tr>'
+      + `<th>录音 ${c.job_a} 可能范围</th><th>录音 ${c.job_b} 可能范围</th><th>涉及共同段数</th><th>包内文件</th>`
+      + '</tr></thead><tbody>'
+      + R.ambiguous_regions.map(g => `<tr><td>${rng(g.a_lo, g.a_hi)}</td><td>${rng(g.b_lo, g.b_hi)}</td>`
+        + `<td>${g.matched}</td><td class="muted">${names(g.a_names)}<br>${names(g.b_names)}</td></tr>`).join('')
+      + '</tbody></table>';
+  }
+  div.innerHTML = h;
+}
+
 async function startJob() {
   const url = document.getElementById('url').value.trim();
   if (!url) return;

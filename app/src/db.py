@@ -34,6 +34,15 @@ CREATE TABLE IF NOT EXISTS segments (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_segments_job_url
   ON segments(job_id, url) WHERE url IS NOT NULL;
+CREATE TABLE IF NOT EXISTS comparisons (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_a INTEGER NOT NULL,
+  job_b INTEGER NOT NULL,
+  state TEXT NOT NULL DEFAULT 'running',   -- running | done | failed
+  created_at REAL NOT NULL,
+  error TEXT,
+  result TEXT               -- 对照报告 JSON；失败时不发布（保持 NULL）
+);
 """
 
 
@@ -205,3 +214,49 @@ class DB:
                 (job_id,),
             ).fetchall()
             return [r["seq"] for r in rows]
+
+    # ---- comparisons ----
+
+    def insert_comparison(self, job_a: int, job_b: int) -> int:
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO comparisons(job_a, job_b, created_at) VALUES (?,?,?)",
+                (job_a, job_b, time.time()),
+            )
+            return cur.lastrowid
+
+    def comparison_done(self, cmp_id: int, result_json: str):
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE comparisons SET state='done', result=? WHERE id=?",
+                (result_json, cmp_id),
+            )
+
+    def comparison_failed(self, cmp_id: int, error: str):
+        # 校验失败不发布结果：result 保持 NULL，只记录原因
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE comparisons SET state='failed', error=?, result=NULL WHERE id=?",
+                (error, cmp_id),
+            )
+
+    def get_comparison(self, cmp_id: int):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM comparisons WHERE id=?", (cmp_id,)).fetchone()
+            return dict(row) if row else None
+
+    def list_comparisons(self):
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM comparisons ORDER BY id DESC").fetchall()
+            return [dict(r) for r in rows]
+
+    def fail_stale_comparisons(self):
+        """重启时把仍在 running 的对照标记为失败（不发布结果）。"""
+        with self._lock, self._conn:
+            self._conn.execute(
+                "UPDATE comparisons SET state='failed', error=?, result=NULL "
+                "WHERE state='running'",
+                ("对照期间服务重启，结果未发布，请重新发起",),
+            )

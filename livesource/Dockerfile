@@ -9,13 +9,19 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY src ./src
 
-# Pre-generate a 2-second playable MPEG-TS seed segment (testsrc + tone).
+# Pre-generate 2-second playable MPEG-TS seed segments (testsrc + tone).
+# seed_alt has a different tone so "alt" segments differ byte-wise (换播样例).
 RUN ffmpeg -y -loglevel error \
     -f lavfi -i testsrc=size=320x240:rate=15 \
     -f lavfi -i sine=frequency=440:sample_rate=44100 \
     -t 2 -c:v libx264 -preset veryfast -g 30 -c:a aac \
-    -f mpegts /srv/seed.ts
+    -f mpegts /srv/seed.ts \
+ && ffmpeg -y -loglevel error \
+    -f lavfi -i testsrc=size=320x240:rate=15 \
+    -f lavfi -i sine=frequency=880:sample_rate=44100 \
+    -t 2 -c:v libx264 -preset veryfast -g 30 -c:a aac \
+    -f mpegts /srv/seed_alt.ts
 
-ENV WINDOW_SIZE=5 SEGMENT_DURATION=2 SEED_TS=/srv/seed.ts
+ENV WINDOW_SIZE=5 SEGMENT_DURATION=2 SEED_TS=/srv/seed.ts SEED_ALT_TS=/srv/seed_alt.ts
 EXPOSE 8080
 CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8080"]
